@@ -8,10 +8,10 @@
   :root { --bg: #000; --ui: rgba(255,255,255,.85); color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   body { display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; }
-  #stage { position: relative; cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
-  canvas { display: block; filter: blur(0.45px) contrast(1.06); }
-  #bar { position: absolute; left: 0; bottom: 0; height: 3px; width: 0; background: var(--ui); opacity: .55; }
-  #paused { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; }
+  #stage { position: relative; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; filter: blur(0.45px) contrast(1.06); touch-action: none; cursor: pointer; }
+  #bar { position: absolute; left: 0; bottom: 0; height: 3px; width: 0; background: var(--ui); opacity: .55; pointer-events: none; }
+  #paused { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: none; }
   #paused div { width: 0; height: 0; border-left: 46px solid rgba(255,255,255,.8);
     border-top: 28px solid transparent; border-bottom: 28px solid transparent; margin-left: 10px;
     filter: drop-shadow(0 0 8px rgba(0,0,0,.6)); }
@@ -19,8 +19,8 @@
 </style>
 </head>
 <body>
-<div id="stage" title="Click or press Space to pause">
-  <canvas id="c"></canvas>
+<div id="stage">
+  <canvas id="c" aria-label="Animated physics diagrams. Drag any block, ball or disc and it springs back."></canvas>
   <div id="bar"></div>
   <div id="paused"><div></div></div>
 </div>
@@ -30,6 +30,7 @@ const W = 1000, H = 1750, DURATION = 10;
 const BAND_TOP = 455, BAND_BOT = 1295;          // 26% .. 74%
 const INK = '#151413', GRAY = '#aba69d', PAPER = '#e6e2d8';
 const SERIF = '"Times New Roman", Times, serif';
+const SCENES = [{ start: 0, len: 4 }, { start: 4, len: 4.65 }, { start: 8.65, len: 1.35 }];
 
 const stage = document.getElementById('stage');
 const cv = document.getElementById('c');
@@ -62,6 +63,9 @@ noise.width = noise.height = 256;
 
 /* ---------- drawing helpers ---------- */
 const { sin, cos, PI, hypot, atan2, acos } = Math;
+const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+const ease = u => u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+const wrapPI = a => { while (a > PI) a -= 2 * PI; while (a < -PI) a += 2 * PI; return a; };
 function font(s, it, b) { ctx.font = `${b ? 'bold ' : ''}${it ? 'italic ' : ''}${s}px ${SERIF}`; }
 function L(x1, y1, x2, y2, w = 3) { ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
 function poly(pts, fill = INK) { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fillStyle = fill; ctx.fill(); }
@@ -137,37 +141,97 @@ function vec(pre, sub, x, y, s = 30) {
   if (sub) { font(s * 0.6, true); ctx.fillText(sub, cx, y + s * 0.26); }
 }
 function leader(x1, y1, x2, y2) { L(x1, y1, x2, y2, 1.6); }
-const ease = u => u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
 
-/* ---------- Scene 1: pulley-and-block machine (0 – 4.0 s) ---------- */
+/* ---------- Interaction: draggable parts on damped springs ----------
+   Every draggable part has a scalar offset (pixels along an axis, or radians around a pivot)
+   added on top of its scripted motion. Dragging sets the offset; letting go hands it to a
+   damped spring, so the part bounces back into the animation. */
+const phys = {};                 // id -> { off, vel, min, max, k, c }
+let parts = [];                  // draggable parts registered by the scene drawn this frame
+let drag = null, hoverId = null, mouse = null, touched = false;
+
+function P(id) { return phys[id] || (phys[id] = { off: 0, vel: 0, min: -Infinity, max: Infinity, k: 90, c: 3.2 }); }
+function off(id) { return P(id).off; }
+function reg(id, o) {
+  o.id = id; parts.push(o);
+  const s = P(id); s.min = o.min; s.max = o.max; s.k = o.k || 90; s.c = o.c || 3.2;
+}
+function circleHit(cx, cy, r) { return (x, y) => hypot(x - cx, y - cy) <= r; }
+function rectHit(cx, cy, w, h, ang = 0, pad = 10) {
+  return (x, y) => {
+    const dx = x - cx, dy = y - cy;
+    const lx = dx * cos(ang) + dy * sin(ang), ly = -dx * sin(ang) + dy * cos(ang);
+    return Math.abs(lx) <= w / 2 + pad && Math.abs(ly) <= h / 2 + pad;
+  };
+}
+// Draw a part "lifted" (drop shadow) while it is hovered or held.
+function lift(id, fn) {
+  if (id !== hoverId && !(drag && drag.id === id)) return fn();
+  ctx.save();
+  ctx.shadowColor = 'rgba(45,35,20,.5)'; ctx.shadowBlur = 16; ctx.shadowOffsetY = 7;
+  const r = fn(); ctx.restore(); return r;
+}
+function partById(id) { return parts.find(p => p.id === id); }
+function hitTest(x, y) { for (let i = parts.length - 1; i >= 0; i--) if (parts[i].hit(x, y)) return parts[i]; return null; }
+
+function beginDrag(part, x, y, ghost) {
+  const s = P(part.id); s.vel = 0;
+  drag = { id: part.id, ghost, px: x, py: y, sx: x, sy: y, b0: part.base, o0: s.off, samples: [] };
+  if (part.type === 'ang') drag.a0 = atan2(y - part.pivot[1], x - part.pivot[0]);
+}
+function updateDrag(now) {
+  if (!drag) return;
+  const part = partById(drag.id);
+  if (!part) { drag = null; return; }
+  const s = P(drag.id);
+  const v = part.type === 'lin'
+    ? drag.b0 + drag.o0 + (drag.px - drag.sx) * part.axis[0] + (drag.py - drag.sy) * part.axis[1] - part.base
+    : drag.b0 + drag.o0 + part.dir * wrapPI(atan2(drag.py - part.pivot[1], drag.px - part.pivot[0]) - drag.a0) - part.base;
+  s.off = clamp(v, s.min, s.max); s.vel = 0;
+  drag.samples.push({ t: now, o: s.off });
+  while (drag.samples.length > 2 && now - drag.samples[0].t > 90) drag.samples.shift();
+}
+function endDrag() {
+  if (!drag) return;
+  const s = P(drag.id), a = drag.samples[0], b = drag.samples[drag.samples.length - 1];
+  const part = partById(drag.id), cap = part && part.type === 'ang' ? 18 : 2500;
+  s.vel = a && b && b.t - a.t > 10 ? clamp((b.o - a.o) / ((b.t - a.t) / 1000), -cap, cap) : 0;
+  drag = null;
+}
+function stepPhys(dt) {
+  const n = 4, h = dt / n;
+  for (const id in phys) {
+    if (drag && drag.id === id) continue;
+    const s = phys[id];
+    for (let i = 0; i < n; i++) { s.vel += (-s.k * s.off - s.c * s.vel) * h; s.off += s.vel * h; }
+    if (s.off < s.min) { s.off = s.min; s.vel = -s.vel * 0.35; }
+    if (s.off > s.max) { s.off = s.max; s.vel = -s.vel * 0.35; }
+  }
+}
+
+/* ---------- Scene 1: pulley-and-block machine ---------- */
 function scene1(t) {
   const w = 2 * PI / 1.9;
   const s1 = sin(w * t), s2 = sin(w * t + 1.3), s3 = sin(w * t + 2.4), s4 = sin(w * t * 1.2 + 0.5);
+  const oDisc = off('s1.disc'), oM1 = off('s1.m1'), oM2 = off('s1.m2'), oM3 = off('s1.m3'), oC = off('s1.C');
   ctx.strokeStyle = INK; ctx.fillStyle = INK;
 
   // Ceiling, pin, spring, wire
   L(315, 577, 485, 577, 5); hatch(315, 577, 485, 577, -1, 18, 16);
   poly([[391, 577], [409, 577], [400, 594]]);
-  const cx = 400, cy = 735 + 32 * s1, R = 80;
-  const springEnd = 594 + 25 + 68 * (0.5 + 0.5 * s1);
+  const R = 80, cx = 400, cyBase = 735 + 32 * s1 - 0.3 * oM3, cy = cyBase + oDisc;
+  const springEnd = Math.min(Math.max(619 + 68 * (0.5 + 0.5 * s1) + 0.85 * oDisc, 606), cy - R + 4);
   coil(400, 594, 400, springEnd, 7, 17, 4, 3);
   L(400, springEnd, cx, cy, 2.5);
 
-  // Disc
-  circ(cx, cy, R, GRAY, 6);
-  circ(cx, cy, 7, '#fff', 3);
-  const ra = 0.75;
-  arrow(cx, cy, cx + R * cos(ra) * 0.96, cy + R * sin(ra) * 0.96, 2, 12);
-  sym('r', null, cx + 30, cy + 44, 28);
-  const ma = -0.7;
-  leader(cx + R * cos(ma), cy + R * sin(ma), cx + 112, cy - 100);
-  sym('m', '4', cx + 118, cy - 112, 32, 'l');
-
-  // Block m1, A-frame pulleys
-  const bx = 162 + 24 * s2, rf = bx + 280;
+  // Positions (the cable couples the parts: pulling one tugs the others)
+  const m2Base = 600 + 14 * sin(w * t + 2.2) + 0.6 * Math.max(0, oM1);
+  const bxBase = 162 + 24 * s2 - 0.25 * oDisc + 0.3 * oM3;
+  const m2x = clamp(m2Base + oM2, 432, 700);
+  const bx = clamp(bxBase + oM1, 132, m2x - 300), rf = bx + 280;
   const P1 = [bx + 90, 945], P2 = [bx + 258, 945];
   const A = [110, 840];
-  const y3 = 830 + 55 * s3;
+  const y3Base = 830 + 55 * s3 - 0.5 * oDisc, y3 = clamp(y3Base + oM3, 705, 1115);
   const TP = [867, 525], TR = 18;
 
   // Slot walls
@@ -175,16 +239,17 @@ function scene1(t) {
   L(130, 1098, 770, 1098, 3); L(130, 1106, 770, 1106, 3); hatch(130, 1106, 770, 1106, 1, 16, 18);
   L(130, 978, 130, 1106, 4); L(770, 978, 770, 1106, 4); hatch(770, 978, 770, 1106, -1, 16, 16);
 
-  rectRot(bx + 140, 1045, 280, 98);
-  sym('m', '1', bx + 140, 1045, 34);
+  lift('s1.m1', () => { rectRot(bx + 140, 1045, 280, 98); sym('m', '1', bx + 140, 1045, 34); });
+  reg('s1.m1', { type: 'lin', axis: [1, 0], base: bxBase, min: 132 - bxBase, max: m2x - 300 - bxBase,
+    at: [bx + 140, 1045], hit: rectHit(bx + 140, 1045, 280, 98) });
   for (const P of [P1, P2]) { L(P[0], P[1], P[0] - 20, 996, 3.5); L(P[0], P[1], P[0] + 20, 996, 3.5); }
 
   // m1 -> spring -> m2
-  const m2x = 600 + 14 * sin(w * t + 2.2);
   poly([[rf, 1054], [rf, 1074], [rf + 16, 1064]]);
   coil(rf + 16, 1064, m2x, 1064, 4, 14, 4, 2.5);
-  rectRot(m2x + 30, 1064, 60, 60, 0, GRAY, 4);
-  sym('m', '2', m2x + 30, 1064, 26);
+  lift('s1.m2', () => { rectRot(m2x + 30, 1064, 60, 60, 0, GRAY, 4); sym('m', '2', m2x + 30, 1064, 26); });
+  reg('s1.m2', { type: 'lin', axis: [1, 0], base: m2Base, min: rf + 20 - m2Base, max: 700 - m2Base,
+    at: [m2x + 30, 1064], hit: rectHit(m2x + 30, 1064, 60, 60, 0, 14) });
 
   // Dimensions
   dotted(130, 1106, 130, 1215); dotted(rf, 1094, rf, 1162); dotted(770, 1106, 770, 1215);
@@ -196,9 +261,13 @@ function scene1(t) {
   L(925, 690, 925, 1250, 4); hatch(925, 690, 925, 1250, -1, 16, 18);
   L(845, 1250, 925, 1250, 4); hatch(845, 1250, 925, 1250, 1, 14, 14);
   coil(885, y3 + 90, 885, 1250, 6, 34, 4, 3);
-  rectRot(885, y3 + 45, 60, 90);
-  poly([[876, y3], [894, y3], [885, y3 - 13]]);
-  sym('m', '3', 885, y3 + 45, 28);
+  lift('s1.m3', () => {
+    rectRot(885, y3 + 45, 60, 90);
+    poly([[876, y3], [894, y3], [885, y3 - 13]]);
+    sym('m', '3', 885, y3 + 45, 28);
+  });
+  reg('s1.m3', { type: 'lin', axis: [0, 1], base: y3Base, min: 705 - y3Base, max: 1115 - y3Base,
+    at: [885, y3 + 45], hit: rectHit(885, y3 + 45, 60, 90, 0, 14) });
 
   // Fixed pulley mount (top right)
   L(TP[0], TP[1], 925, TP[1] - 20, 3); L(925, 470, 925, 560, 4); hatch(925, 470, 925, 560, -1, 14, 14);
@@ -207,6 +276,20 @@ function scene1(t) {
   L(A[0] - 30, A[1] - 16, A[0] - 16, A[1] + 2, 2.5); L(A[0] - 30, A[1] + 2, A[0] - 16, A[1] + 20, 2.5);
   arrow(A[0], A[1], A[0], A[1] - 78, 3, 15); vec('I', '2', A[0] - 52, A[1] - 62, 28);
   arrow(A[0], A[1], A[0] + 78, A[1], 3, 15); vec('I', '1', A[0] + 64, A[1] - 26, 28);
+
+  // Disc
+  lift('s1.disc', () => {
+    circ(cx, cy, R, GRAY, 6);
+    circ(cx, cy, 7, '#fff', 3);
+    const ra = 0.75;
+    arrow(cx, cy, cx + R * cos(ra) * 0.96, cy + R * sin(ra) * 0.96, 2, 12);
+    sym('r', null, cx + 30, cy + 44, 28);
+  });
+  const ma = -0.7;
+  leader(cx + R * cos(ma), cy + R * sin(ma), cx + 112, cy - 100);
+  sym('m', '4', cx + 118, cy - 112, 32, 'l');
+  reg('s1.disc', { type: 'lin', axis: [0, 1], base: cyBase, min: -40, max: 150, k: 70,
+    at: [cx, cy], hit: circleHit(cx, cy, R + 8) });
 
   // Cable
   const base1 = atan2(P1[1] + 16 - cy, P1[0] - cx), a1 = base1 + acos(R / hypot(P1[0] - cx, P1[1] + 16 - cy));
@@ -229,19 +312,23 @@ function scene1(t) {
   wheel(P1[0], P1[1]); wheel(P2[0], P2[1]); wheel(TP[0], TP[1], TR);
   circ(A[0], A[1], 10, PAPER, 3);
 
-  // Dot C sliding on the cable between disc and second pulley
-  const f = 0.15 + 0.6 * (0.5 + 0.5 * s4);
-  const Cx = E[0] + (P2[0] + 6 - E[0]) * f, Cy = E[1] + (P2[1] + 2 - E[1]) * f;
-  circ(Cx, Cy, 10, INK);
+  // Dot C slides along the cable between disc and second pulley
+  const sx = P2[0] + 6 - E[0], sy = P2[1] + 2 - E[1], Ls = hypot(sx, sy), ux = sx / Ls, uy = sy / Ls;
+  const dBase = (0.15 + 0.6 * (0.5 + 0.5 * s4)) * Ls, d = clamp(dBase + oC, 0.05 * Ls, 0.92 * Ls);
+  const Cx = E[0] + ux * d, Cy = E[1] + uy * d;
+  lift('s1.C', () => circ(Cx, Cy, 10, INK));
   leader(Cx + 8, Cy - 6, Cx + 48, Cy - 30);
   sym('C', null, Cx + 62, Cy - 38, 30);
+  reg('s1.C', { type: 'lin', axis: [ux, uy], base: dBase, min: 0.05 * Ls - dBase, max: 0.92 * Ls - dBase,
+    at: [Cx, Cy], hit: circleHit(Cx, Cy, 26) });
 }
 
-/* ---------- Scene 2: swinging three-mass assembly (4.0 – 8.65 s) ---------- */
-function sideAssembly(sgn, Mc, angM, u, w) {
-  const s = sin(w * u + 0.4);
-  const gap = 70 - sgn * 24 * s;
-  const ang = angM + 0.2 * sin(w * u + (sgn < 0 ? 1.1 : 2.6));
+/* ---------- Scene 2: swinging three-mass assembly ---------- */
+function sideAssembly(sgn, Mc, angM, t, w) {
+  const tag = 's2.' + (sgn < 0 ? 'L' : 'R');
+  const gapBase = 70 - sgn * 24 * sin(w * t + 0.4);
+  const gap = clamp(gapBase + off(tag), 14, 170);
+  const ang = angM + 0.2 * sin(w * t + (sgn < 0 ? 1.1 : 2.6));
   const [cx, cy] = rotp(Mc[0], Mc[1], angM, sgn * (65 + gap + 85), 0);
 
   // k_s springs
@@ -251,17 +338,22 @@ function sideAssembly(sgn, Mc, angM, u, w) {
     sym('k', 's', (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 + (ly < 0 ? -34 : 36), 26);
   });
 
-  // m_h hanging arm (drawn under the block)
-  const hph = w * u * 1.15 + (sgn > 0 ? 2 : 0.6);
-  const hp = rotp(cx, cy, ang, 0, 140), ah = PI / 2 + 0.3 * sin(hph);
+  // m_h hanging arm (arm drawn under the block, ball over it)
+  const hid = tag + '.h';
+  const hph = w * t * 1.15 + (sgn > 0 ? 2 : 0.6);
+  const hp = rotp(cx, cy, ang, 0, 140), ahBase = PI / 2 + 0.3 * sin(hph), ah = ahBase + off(hid);
   const hb = [hp[0] + 150 * cos(ah), hp[1] + 150 * sin(ah)];
   if (cos(hph) > 0) dotted(hp[0], hp[1], hp[0], hp[1] + 175);
   L(hp[0], hp[1], hb[0], hb[1], 8);
 
-  rectRot(cx, cy, 170, 280, ang);
-  sym('m', null, cx, cy, 38);
+  lift(tag, () => { rectRot(cx, cy, 170, 280, ang); sym('m', null, cx, cy, 38); });
+  reg(tag, { type: 'lin', axis: [sgn * cos(angM), sgn * sin(angM)], base: gapBase,
+    min: 14 - gapBase, max: 170 - gapBase, k: 80, at: [cx, cy], hit: rectHit(cx, cy, 170, 280, ang) });
+
   circ(hp[0], hp[1], 9, '#f4f1ea', 3);
-  circ(hb[0], hb[1], 24, INK);
+  lift(hid, () => circ(hb[0], hb[1], 24, INK));
+  reg(hid, { type: 'ang', pivot: hp, dir: 1, base: ahBase, min: -1.4, max: 1.4, k: 30, c: 0.9,
+    at: hb, hit: circleHit(hb[0], hb[1], 36) });
   leader(hb[0] + sgn * 22, hb[1] + 8, hb[0] + sgn * 56, hb[1] + 30);
   sym('m', 'h', hb[0] + sgn * 76, hb[1] + 38, 28);
   const lx = hp[0] - sgn * 52;
@@ -271,14 +363,18 @@ function sideAssembly(sgn, Mc, angM, u, w) {
 
   // Side pendulums m_p on the outer edge
   [-70, 70].forEach((ly, i) => {
+    const pid = tag + '.p' + i;
     const p = rotp(cx, cy, ang, sgn * 85, ly);
-    const aa = (sgn < 0 ? PI : 0) + 0.32 * sin(w * u * 1.3 + i * 1.7 + (sgn > 0 ? 0.9 : 0));
+    const aaBase = (sgn < 0 ? PI : 0) + 0.32 * sin(w * t * 1.3 + i * 1.7 + (sgn > 0 ? 0.9 : 0));
+    const aa = aaBase + off(pid);
     const dir = [cos(aa), sin(aa)], Lp = 145;
     const ball = [p[0] + dir[0] * Lp, p[1] + dir[1] * Lp];
     let n = [-dir[1], dir[0]];
     if (n[1] * ly < 0) n = [-n[0], -n[1]];
     L(p[0], p[1], ball[0], ball[1], 8);
-    circ(ball[0], ball[1], 26, INK);
+    lift(pid, () => circ(ball[0], ball[1], 26, INK));
+    reg(pid, { type: 'ang', pivot: p, dir: 1, base: aaBase, min: -1.4, max: 1.4, k: 30, c: 0.9,
+      at: ball, hit: circleHit(ball[0], ball[1], 38) });
     bullseye(p[0], p[1]);
     sym('k', 'tp', p[0] - sgn * 52, p[1] + (ly < 0 ? -22 : 24), 22);
     dim(p[0] + n[0] * 34, p[1] + n[1] * 34, ball[0] + n[0] * 34, ball[1] + n[1] * 34);
@@ -291,9 +387,9 @@ function sideAssembly(sgn, Mc, angM, u, w) {
 }
 
 function scene2(t) {
-  const u = t - 4, w = 2 * PI / 1.6;
+  const w = 2 * PI / 1.6;
   ctx.strokeStyle = INK; ctx.fillStyle = INK;
-  const th = 0.13 * sin(w * u);
+  const thBase = 0.13 * sin(w * t), th = clamp(thBase + off('s2.M'), -0.7, 0.7);
 
   // Ceiling, frame arrows, gravity
   L(375, 595, 665, 595, 6); hatch(375, 595, 665, 595, -1, 18, 16);
@@ -309,18 +405,19 @@ function scene2(t) {
   dotted(P[0], P[1], P[0], P[1] + 125); sym('θ', null, P[0] - 26, P[1] + 92, 28);
   dim(600, 597, 600, Mt[1]); sym('L', null, 622, (597 + Mt[1]) / 2, 30);
 
-  sideAssembly(-1, Mc, angM, u, w);
-  sideAssembly(1, Mc, angM, u, w);
+  sideAssembly(-1, Mc, angM, t, w);
+  sideAssembly(1, Mc, angM, t, w);
 
-  rectRot(Mc[0], Mc[1], 130, 250, angM);
-  sym('M', null, Mc[0], Mc[1] + 10, 40);
+  lift('s2.M', () => { rectRot(Mc[0], Mc[1], 130, 250, angM); sym('M', null, Mc[0], Mc[1] + 10, 40); });
+  reg('s2.M', { type: 'ang', pivot: P, dir: -1, base: thBase, min: -0.7 - thBase, max: 0.7 - thBase, k: 50, c: 1.6,
+    at: Mc, hit: rectHit(Mc[0], Mc[1], 130, 250, angM) });
   L(P[0], P[1], Mt[0], Mt[1], 8);
   circ(P[0], P[1], 9, '#f4f1ea', 3);
   bullseye(Mt[0], Mt[1], 17);
   sym('k', 't', Mt[0] + 46, Mt[1] - 18, 26);
 }
 
-/* ---------- Scene 3: two slabs on a sliding base (8.65 – 10 s) ---------- */
+/* ---------- Scene 3: two slabs on a sliding base ---------- */
 function slab(K, ang) {
   const S = rotp(K[0], K[1], ang, 0, -52);
   const C = rotp(K[0], K[1], ang, 0, -66);
@@ -331,9 +428,10 @@ function slab(K, ang) {
   return { C, ang };
 }
 function scene3(t) {
-  const u = (t - 8.65) / 1.35;
+  const u = Math.min(t / 1.35, 1), ph = 2 * PI * t / 1.35 * 1.3;
   ctx.strokeStyle = INK; ctx.fillStyle = INK;
-  const dx = -8 + 46 * ease(u), ph = 2 * PI * u * 1.3;
+  const baseX = 200 - 8 + 46 * ease(u);
+  const x0 = clamp(baseX + off('s3.base'), 40, 362);
 
   // Ground with hatching
   ctx.save(); ctx.beginPath(); ctx.rect(0, 1015, W, 34); ctx.clip();
@@ -348,17 +446,24 @@ function scene3(t) {
   arrow(12, 922, 12, 868, 3, 14);
 
   // Base + side springs
-  const x0 = 200 + dx;
   coil(12, 980, x0, 980, 5, 18, 6, 3);
   coil(x0 + 600, 980, 988, 980, 4, 18, 6, 3);
-  rectRot(x0 + 300, 980, 600, 70);
-  sym('M', null, x0 + 300, 984, 38);
+  lift('s3.base', () => { rectRot(x0 + 300, 980, 600, 70); sym('M', null, x0 + 300, 984, 38); });
+  reg('s3.base', { type: 'lin', axis: [1, 0], base: baseX, min: 40 - baseX, max: 362 - baseX, k: 60, c: 2.2,
+    at: [x0 + 300, 980], hit: rectHit(x0 + 300, 980, 600, 70) });
   arrow(x0 + 28, 1000, x0 + 28, 922, 2.5, 12); vec('M', '2', x0 + 38, 950, 22);
   arrow(x0 + 28, 1000, x0 + 112, 1000, 2.5, 12); vec('M', '1', x0 + 86, 1000 - 18, 22);
 
+  // Slabs lean against the base's motion (inertia), plus any drag
   const K1 = [x0 + 130, 945], K2 = [x0 + 470, 945];
-  const th1 = 0.04 * sin(ph), th2 = -(0.13 + 0.05 * sin(ph + 0.8));
-  const s1 = slab(K1, th1), s2 = slab(K2, th2);
+  const inert = clamp(-0.0006 * P('s3.base').vel, -0.35, 0.35);
+  const b1 = 0.04 * sin(ph) + inert, b2 = -(0.13 + 0.05 * sin(ph + 0.8)) + inert * 1.3;
+  const th1 = clamp(b1 + off('s3.s1'), -0.7, 0.7), th2 = clamp(b2 + off('s3.s2'), -0.7, 0.7);
+  const s1 = lift('s3.s1', () => slab(K1, th1)), s2 = lift('s3.s2', () => slab(K2, th2));
+  reg('s3.s1', { type: 'ang', pivot: K1, dir: 1, base: b1, min: -0.6, max: 0.6, k: 45, c: 1.6,
+    at: s1.C, hit: rectHit(s1.C[0], s1.C[1], 250, 28, th1, 14) });
+  reg('s3.s2', { type: 'ang', pivot: K2, dir: 1, base: b2, min: -0.6, max: 0.6, k: 45, c: 1.6,
+    at: s2.C, hit: rectHit(s2.C[0], s2.C[1], 250, 28, th2, 14) });
   bullseye(K1[0], K1[1]); bullseye(K2[0], K2[1]);
   sym('k', 't1', K1[0] + 52, 1000, 22); sym('k', 't2', K2[0] + 52, 1000, 22);
 
@@ -379,37 +484,64 @@ function scene3(t) {
   dotted(top1[0], top1[1], top1[0], top1[1] - 78); sym('θ', '1', top1[0] + 4, top1[1] - 98, 26);
   const top2 = rotp(s2.C[0], s2.C[1], th2, 0, -14);
   dotted(top2[0], top2[1], top2[0], top2[1] - 82);
-  dotted(top2[0], top2[1], top2[0] + 82 * sin(-th2) * -1, top2[1] - 82 * cos(th2));
-  ctx.lineWidth = 1.6; ctx.beginPath(); ctx.arc(top2[0], top2[1], 58, -PI / 2 + th2, -PI / 2); ctx.stroke();
-  head(top2[0] - 58 * sin(-th2) - 4, top2[1] - 58 * cos(th2) + 2, top2[0] + 1, top2[1] - 58, 8);
+  dotted(top2[0], top2[1], top2[0] + 82 * sin(th2), top2[1] - 82 * cos(th2));
+  ctx.lineWidth = 1.6; ctx.beginPath();
+  ctx.arc(top2[0], top2[1], 58, -PI / 2 + Math.min(th2, 0), -PI / 2 + Math.max(th2, 0)); ctx.stroke();
   sym('θ', '2', top2[0] - 6, top2[1] - 104, 26);
 
   dim(10, 1242, 990, 1242); sym('D', null, 500, 1270, 30);
 }
 
-/* ---------- Caption ---------- */
-function caption() {
-  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left'; ctx.lineJoin = 'round';
-  const fs = 52; font(fs, false, true);
-  const lines = ['“The type of questions', 'you see at the back of your', 'Physics test after you already'];
-  const ys = [310, 364, 418, 472];
-  const outlined = (s, x, y) => {
-    ctx.lineWidth = 10; ctx.strokeStyle = '#000'; ctx.strokeText(s, x, y);
-    ctx.fillStyle = '#fff'; ctx.fillText(s, x, y);
-  };
-  lines.forEach((s, i) => outlined(s, 500 - ctx.measureText(s).width / 2, ys[i]));
-  const parts = ['skipped ', '9', ' questions”'];
-  const widths = parts.map(p => ctx.measureText(p).width);
-  let x = 500 - widths.reduce((a, b) => a + b) / 2;
-  parts.forEach((p, i) => {
-    outlined(p, x, ys[3]);
-    if (i === 1) { ctx.lineWidth = 1.8; ctx.strokeStyle = '#fff'; ctx.strokeText(p, x, ys[3]); }
-    x += widths[i];
-  });
+/* ---------- Hint and demo pointer ---------- */
+function hint() {
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  font(66, false, true); ctx.fillStyle = '#fff';
+  ctx.fillText('This isn’t a video.', 500, 300);
+  font(38, true); ctx.fillStyle = '#bdb7aa';
+  ctx.fillText(touched ? 'Now fling one. It springs back.' : 'Grab any part and give it a pull.', 500, 374);
+  ctx.restore();
+}
+
+// Until the viewer touches something, a ghost pointer demonstrates a pull once per scene.
+const GHOST = [{ at: 0.7, id: 's1.disc', dx: 0, dy: 150 }, { at: 1.0, id: 's2.R.h', dx: 150, dy: -40 }, null];
+let ghost = null, ghostVisit = -1, visit = 0;
+function runGhost(dt) {
+  if (touched) return;
+  if (!ghost) {
+    const g = GHOST[sceneIdx];
+    if (g && playing && !drag && ghostVisit !== visit && local >= g.at) {
+      const part = partById(g.id);
+      if (part) {
+        ghostVisit = visit;
+        ghost = { g, t: 0, x0: part.at[0], y0: part.at[1], x: part.at[0], y: part.at[1] };
+        beginDrag(part, ghost.x, ghost.y, true);
+      }
+    }
+    return;
+  }
+  ghost.t += dt;
+  const k = ease((ghost.t - 0.3) / 0.6);
+  ghost.x = ghost.x0 + ghost.g.dx * k; ghost.y = ghost.y0 + ghost.g.dy * k;
+  if (drag && drag.ghost) { drag.px = ghost.x; drag.py = ghost.y; if (ghost.t > 1.2) endDrag(); }
+  if (ghost.t > 1.8) ghost = null;
+}
+function cancelGhost() { if (drag && drag.ghost) drag = null; ghost = null; }
+function drawGhost() {
+  if (!ghost) return;
+  const t = ghost.t;
+  const a = t < 0.2 ? t / 0.2 : t > 1.3 ? Math.max(0, 1 - (t - 1.3) / 0.5) : 1;
+  const pressed = t > 0.22 && t < 1.2;
+  ctx.save(); ctx.globalAlpha = a; ctx.strokeStyle = INK;
+  circ(ghost.x, ghost.y, pressed ? 22 : 30, 'rgba(255,255,255,.55)', 3);
+  if (pressed) circ(ghost.x, ghost.y, 34, null, 1.5);
+  circ(ghost.x, ghost.y, 5, INK);
+  ctx.restore();
 }
 
 /* ---------- Frame ---------- */
-function draw(t) {
+let sceneIdx = 0, local = 0, playing = true, holdUntil = 0;
+function draw() {
+  parts = [];
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.setLineDash([]);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
@@ -417,27 +549,85 @@ function draw(t) {
 
   ctx.save();
   ctx.beginPath(); ctx.rect(0, BAND_TOP, W, BAND_BOT - BAND_TOP); ctx.clip();
-  if (t < 4.0) scene1(t); else if (t < 8.65) scene2(t); else scene3(t);
+  [scene1, scene2, scene3][sceneIdx](local);
   for (let y = BAND_TOP; y < BAND_BOT; y += 256) for (let x = 0; x < W; x += 256) ctx.drawImage(noise, x, y);
+  drawGhost();
   ctx.restore();
 
-  caption();
+  hint();
 }
 
-let elapsed = 0, last = performance.now(), playing = true;
+// While someone is hovering or playing with a part, stay on the current diagram.
+function advance(dt, now) {
+  if (!playing) return;
+  local += dt;
+  const len = SCENES[sceneIdx].len;
+  if (local < len) return;
+  const held = now < holdUntil || (drag && !drag.ghost) || hoverId;
+  if (held) { if (sceneIdx < 2) local %= len; return; }   // scene 3 keeps settling past its end
+  sceneIdx = (sceneIdx + 1) % 3; local = 0; visit++;
+}
+function seek(g) {
+  g = ((g % DURATION) + DURATION) % DURATION;
+  for (let i = 2; i >= 0; i--) if (g >= SCENES[i].start) {
+    if (i !== sceneIdx) { visit++; cancelGhost(); }
+    sceneIdx = i; local = g - SCENES[i].start; return;
+  }
+}
+function updateCursor() {
+  cv.style.cursor = drag && !drag.ghost ? 'grabbing' : hoverId ? 'grab' : 'pointer';
+}
+
+let last = performance.now();
 function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.1); last = now;
-  if (playing) elapsed = (elapsed + dt) % DURATION;
-  draw(elapsed);
-  bar.style.width = (elapsed / DURATION * 100) + '%';
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  advance(dt, now);
+  runGhost(dt);
+  updateDrag(now);
+  stepPhys(dt);
+  if (mouse && !(drag && !drag.ghost)) { const p = hitTest(mouse[0], mouse[1]); hoverId = p ? p.id : null; }
+  draw();
+  updateCursor();
+  const sc = SCENES[sceneIdx];
+  bar.style.width = ((sc.start + Math.min(local, sc.len)) / DURATION * 100) + '%';
   requestAnimationFrame(loop);
 }
+
+/* ---------- Input ---------- */
+function toLogical(e) {
+  const r = cv.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width * W, (e.clientY - r.top) / r.height * H];
+}
 function toggle() { playing = !playing; stage.classList.toggle('is-paused', !playing); }
-stage.addEventListener('click', toggle);
+let down = null;
+cv.addEventListener('pointerdown', e => {
+  const [x, y] = toLogical(e), part = hitTest(x, y);
+  down = { x: e.clientX, y: e.clientY, onPart: !!part };
+  if (part) {
+    cancelGhost(); touched = true;
+    beginDrag(part, x, y, false);
+    cv.setPointerCapture(e.pointerId);
+  }
+});
+cv.addEventListener('pointermove', e => {
+  const [x, y] = toLogical(e);
+  if (e.pointerType === 'mouse') mouse = [x, y];
+  if (drag && !drag.ghost) { drag.px = x; drag.py = y; }
+});
+function release(e) {
+  if (drag && !drag.ghost) { endDrag(); holdUntil = performance.now() + 3000; }
+  else if (down && !down.onPart && e.type === 'pointerup' && hypot(e.clientX - down.x, e.clientY - down.y) < 8) toggle();
+  if (e.pointerType !== 'mouse') hoverId = null;
+  down = null;
+}
+cv.addEventListener('pointerup', release);
+cv.addEventListener('pointercancel', release);
+cv.addEventListener('pointerleave', () => { mouse = null; if (!(drag && !drag.ghost)) hoverId = null; });
 addEventListener('keydown', e => {
+  const g = SCENES[sceneIdx].start + Math.min(local, SCENES[sceneIdx].len);
   if (e.code === 'Space') { e.preventDefault(); toggle(); }
-  if (e.code === 'ArrowRight') elapsed = (elapsed + 0.5) % DURATION;
-  if (e.code === 'ArrowLeft') elapsed = (elapsed - 0.5 + DURATION) % DURATION;
+  if (e.code === 'ArrowRight') seek(g + 0.5);
+  if (e.code === 'ArrowLeft') seek(g - 0.5);
 });
 requestAnimationFrame(loop);
 </script>
