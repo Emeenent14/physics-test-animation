@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Back of the Physics Test</title>
+<style>
+  :root { --bg: #000; --ui: rgba(255,255,255,.85); color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; }
+  #stage { position: relative; cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; filter: blur(0.45px) contrast(1.06); }
+  #bar { position: absolute; left: 0; bottom: 0; height: 3px; width: 0; background: var(--ui); opacity: .55; }
+  #paused { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; }
+  #paused div { width: 0; height: 0; border-left: 46px solid rgba(255,255,255,.8);
+    border-top: 28px solid transparent; border-bottom: 28px solid transparent; margin-left: 10px;
+    filter: drop-shadow(0 0 8px rgba(0,0,0,.6)); }
+  #stage.is-paused #paused { display: flex; }
+</style>
+</head>
+<body>
+<div id="stage" title="Click or press Space to pause">
+  <canvas id="c"></canvas>
+  <div id="bar"></div>
+  <div id="paused"><div></div></div>
+</div>
+<script>
+// Logical canvas: 1000 x 1750 (portrait, ~1.75:1). Everything is drawn in these units.
+const W = 1000, H = 1750, DURATION = 10;
+const BAND_TOP = 455, BAND_BOT = 1295;          // 26% .. 74%
+const INK = '#151413', GRAY = '#aba69d', PAPER = '#e6e2d8';
+const SERIF = '"Times New Roman", Times, serif';
+
+const stage = document.getElementById('stage');
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const bar = document.getElementById('bar');
+let scale = 1;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let h = innerHeight, w = h * W / H;
+  if (w > innerWidth) { w = innerWidth; h = w * H / W; }
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  scale = cv.width / W;
+}
+addEventListener('resize', resize); resize();
+
+// Photocopy speckle texture
+const noise = document.createElement('canvas');
+noise.width = noise.height = 256;
+{
+  const n = noise.getContext('2d'), img = n.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = Math.random() < 0.5 ? 0 : 255;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = Math.random() * 40;
+  }
+  n.putImageData(img, 0, 0);
+}
+
+/* ---------- drawing helpers ---------- */
+const { sin, cos, PI, hypot, atan2, acos } = Math;
+function font(s, it, b) { ctx.font = `${b ? 'bold ' : ''}${it ? 'italic ' : ''}${s}px ${SERIF}`; }
+function L(x1, y1, x2, y2, w = 3) { ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function poly(pts, fill = INK) { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fillStyle = fill; ctx.fill(); }
+function circ(x, y, r, fill, lw = 0) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (lw) { ctx.lineWidth = lw; ctx.stroke(); }
+}
+function rectRot(cx, cy, w, h, ang = 0, fill = GRAY, lw = 5) {
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang);
+  ctx.fillStyle = fill; ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.lineWidth = lw; ctx.strokeRect(-w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+function rotp(cx, cy, ang, lx, ly) { return [cx + lx * cos(ang) - ly * sin(ang), cy + lx * sin(ang) + ly * cos(ang)]; }
+function head(x1, y1, x2, y2, s = 15) {
+  const a = atan2(y2 - y1, x2 - x1);
+  poly([[x2, y2], [x2 - s * cos(a - 0.38), y2 - s * sin(a - 0.38)], [x2 - s * cos(a + 0.38), y2 - s * sin(a + 0.38)]]);
+}
+function arrow(x1, y1, x2, y2, w = 3, s = 16) {
+  const a = atan2(y2 - y1, x2 - x1);
+  L(x1, y1, x2 - cos(a) * s * 0.6, y2 - sin(a) * s * 0.6, w); head(x1, y1, x2, y2, s);
+}
+function dim(x1, y1, x2, y2, w = 2, s = 13) {
+  const a = atan2(y2 - y1, x2 - x1), k = s * 0.6;
+  L(x1 + cos(a) * k, y1 + sin(a) * k, x2 - cos(a) * k, y2 - sin(a) * k, w);
+  head(x2, y2, x1, y1, s); head(x1, y1, x2, y2, s);
+}
+function dotted(x1, y1, x2, y2, w = 2) { ctx.setLineDash([3, 7]); L(x1, y1, x2, y2, w); ctx.setLineDash([]); }
+// Slash marks along a segment, on one side (side = +1 / -1), leaning "forward".
+function hatch(x1, y1, x2, y2, side, len = 18, gap = 15) {
+  const dx = x2 - x1, dy = y2 - y1, l = hypot(dx, dy), ux = dx / l, uy = dy / l;
+  const nx = -uy * side, ny = ux * side;
+  for (let s = gap / 2; s < l; s += gap) {
+    const px = x1 + ux * s, py = y1 + uy * s;
+    L(px, py, px + nx * len + ux * len * 0.7, py + ny * len + uy * len * 0.7, 2);
+  }
+}
+// Coil spring drawn as stacked sideways loops (a trochoid). Squeeze it and the loops bunch up.
+function coil(x1, y1, x2, y2, loops, r, lead = 10, w = 3) {
+  const dx = x2 - x1, dy = y2 - y1, l = Math.max(hypot(dx, dy), 1), ux = dx / l, uy = dy / l, nx = -uy, ny = ux;
+  const Lc = Math.max(l - 2 * lead, 1), a = Lc / (2 * PI * loops), b = r * 0.75, steps = loops * 36;
+  ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x1, y1);
+  for (let i = 0; i <= steps; i++) {
+    const p = i / steps * 2 * PI * loops;
+    const al = lead + a * p + b * (1 - cos(p)), pe = r * sin(p);
+    ctx.lineTo(x1 + ux * al + nx * pe, y1 + uy * al + ny * pe);
+  }
+  ctx.lineTo(x2, y2); ctx.stroke();
+}
+function bullseye(x, y, r = 15) { circ(x, y, r, '#f4f1ea', 3); circ(x, y, r * 0.64, null, 2.5); circ(x, y, r * 0.3, INK); }
+function wheel(x, y, r = 16) { circ(x, y, r, '#f6f3ec', 3.5); circ(x, y, r * 0.38, null, 2.5); }
+// Italic symbol with optional subscript (and optional pre-subscript).
+function sym(main, sub, x, y, s = 32, align = 'c', pre) {
+  ctx.fillStyle = INK; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  font(s, true); const mw = ctx.measureText(main).width;
+  font(s * 0.62, true);
+  const sw = sub ? ctx.measureText(sub).width + 1 : 0, pw = pre ? ctx.measureText(pre).width + 1 : 0;
+  const tot = pw + mw + sw;
+  let cx = align === 'c' ? x - tot / 2 : align === 'r' ? x - tot : x;
+  if (pre) { ctx.fillText(pre, cx, y + s * 0.22); cx += pw; }
+  font(s, true); ctx.fillText(main, cx, y); cx += mw + 1;
+  if (sub) { font(s * 0.62, true); ctx.fillText(sub, cx, y + s * 0.26); }
+}
+// Unit-vector label like  ᵢe⃗₁
+function vec(pre, sub, x, y, s = 30) {
+  ctx.fillStyle = INK; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let cx = x;
+  if (pre) { font(s * 0.55, false); ctx.fillText(pre, cx, y + s * 0.22); cx += ctx.measureText(pre).width + 1; }
+  font(s, true); const ew = ctx.measureText('e').width; ctx.fillText('e', cx, y);
+  const ay = y - s * 0.5; L(cx + 1, ay, cx + ew + 1, ay, 1.6); head(cx, ay, cx + ew + 4, ay, 6);
+  cx += ew + 1;
+  if (sub) { font(s * 0.6, true); ctx.fillText(sub, cx, y + s * 0.26); }
+}
+function leader(x1, y1, x2, y2) { L(x1, y1, x2, y2, 1.6); }
+const ease = u => u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+
+/* ---------- Scene 1: pulley-and-block machine (0 – 4.0 s) ---------- */
+function scene1(t) {
+  const w = 2 * PI / 1.9;
+  const s1 = sin(w * t), s2 = sin(w * t + 1.3), s3 = sin(w * t + 2.4), s4 = sin(w * t * 1.2 + 0.5);
+  ctx.strokeStyle = INK; ctx.fillStyle = INK;
+
+  // Ceiling, pin, spring, wire
+  L(315, 577, 485, 577, 5); hatch(315, 577, 485, 577, -1, 18, 16);
+  poly([[391, 577], [409, 577], [400, 594]]);
+  const cx = 400, cy = 735 + 32 * s1, R = 80;
+  const springEnd = 594 + 25 + 68 * (0.5 + 0.5 * s1);
+  coil(400, 594, 400, springEnd, 7, 17, 4, 3);
+  L(400, springEnd, cx, cy, 2.5);
+
+  // Disc
+  circ(cx, cy, R, GRAY, 6);
+  circ(cx, cy, 7, '#fff', 3);
+  const ra = 0.75;
+  arrow(cx, cy, cx + R * cos(ra) * 0.96, cy + R * sin(ra) * 0.96, 2, 12);
+  sym('r', null, cx + 30, cy + 44, 28);
+  const ma = -0.7;
+  leader(cx + R * cos(ma), cy + R * sin(ma), cx + 112, cy - 100);
+  sym('m', '4', cx + 118, cy - 112, 32, 'l');
+
+  // Block m1, A-frame pulleys
+  const bx = 162 + 24 * s2, rf = bx + 280;
+  const P1 = [bx + 90, 945], P2 = [bx + 258, 945];
+  const A = [110, 840];
+  const y3 = 830 + 55 * s3;
+  const TP = [867, 525], TR = 18;
+
+  // Slot walls
+  L(130, 978, 770, 978, 3); L(130, 986, 770, 986, 3); hatch(130, 978, 770, 978, -1, 16, 18);
+  L(130, 1098, 770, 1098, 3); L(130, 1106, 770, 1106, 3); hatch(130, 1106, 770, 1106, 1, 16, 18);
+  L(130, 978, 130, 1106, 4); L(770, 978, 770, 1106, 4); hatch(770, 978, 770, 1106, -1, 16, 16);
+
+  rectRot(bx + 140, 1045, 280, 98);
+  sym('m', '1', bx + 140, 1045, 34);
+  for (const P of [P1, P2]) { L(P[0], P[1], P[0] - 20, 996, 3.5); L(P[0], P[1], P[0] + 20, 996, 3.5); }
+
+  // m1 -> spring -> m2
+  const m2x = 600 + 14 * sin(w * t + 2.2);
+  poly([[rf, 1054], [rf, 1074], [rf + 16, 1064]]);
+  coil(rf + 16, 1064, m2x, 1064, 4, 14, 4, 2.5);
+  rectRot(m2x + 30, 1064, 60, 60, 0, GRAY, 4);
+  sym('m', '2', m2x + 30, 1064, 26);
+
+  // Dimensions
+  dotted(130, 1106, 130, 1215); dotted(rf, 1094, rf, 1162); dotted(770, 1106, 770, 1215);
+  dim(130, 1150, rf, 1150); sym('x', '1', (130 + rf) / 2, 1128, 30);
+  dim(130, 1205, 770, 1205); sym('D', null, 450, 1184, 30);
+
+  // Weight channel with m3
+  L(845, 690, 845, 1250, 4); hatch(845, 690, 845, 1250, 1, 16, 18);
+  L(925, 690, 925, 1250, 4); hatch(925, 690, 925, 1250, -1, 16, 18);
+  L(845, 1250, 925, 1250, 4); hatch(845, 1250, 925, 1250, 1, 14, 14);
+  coil(885, y3 + 90, 885, 1250, 6, 34, 4, 3);
+  rectRot(885, y3 + 45, 60, 90);
+  poly([[876, y3], [894, y3], [885, y3 - 13]]);
+  sym('m', '3', 885, y3 + 45, 28);
+
+  // Fixed pulley mount (top right)
+  L(TP[0], TP[1], 925, TP[1] - 20, 3); L(925, 470, 925, 560, 4); hatch(925, 470, 925, 560, -1, 14, 14);
+
+  // Anchor + coordinate arrows
+  L(A[0] - 30, A[1] - 16, A[0] - 16, A[1] + 2, 2.5); L(A[0] - 30, A[1] + 2, A[0] - 16, A[1] + 20, 2.5);
+  arrow(A[0], A[1], A[0], A[1] - 78, 3, 15); vec('I', '2', A[0] - 52, A[1] - 62, 28);
+  arrow(A[0], A[1], A[0] + 78, A[1], 3, 15); vec('I', '1', A[0] + 64, A[1] - 26, 28);
+
+  // Cable
+  const base1 = atan2(P1[1] + 16 - cy, P1[0] - cx), a1 = base1 + acos(R / hypot(P1[0] - cx, P1[1] + 16 - cy));
+  const base2 = atan2(P2[1] + 16 - cy, P2[0] - cx), a2 = base2 - acos(R / hypot(P2[0] - cx, P2[1] + 16 - cy));
+  const E = [cx + R * cos(a2), cy + R * sin(a2)];
+  const solid = t >= 3.5;
+  ctx.setLineDash(solid ? [] : [16, 10]);
+  ctx.lineDashOffset = solid ? 0 : -t * 55;
+  ctx.lineWidth = solid ? 6.5 : 5; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(A[0], A[1]);
+  ctx.arc(P1[0], P1[1], 16, 0.8 * PI, 0.2 * PI, true);
+  ctx.arc(cx, cy, R, a1, a2 + (a2 < a1 ? 2 * PI : 0));
+  ctx.arc(P2[0], P2[1], 16, 0.8 * PI, 0.2 * PI, true);
+  ctx.arc(TP[0], TP[1], TR, -0.75 * PI, 0);
+  ctx.lineTo(TP[0] + TR, y3 - 13);
+  ctx.stroke();
+  ctx.setLineDash([]); ctx.lineDashOffset = 0;
+
+  wheel(P1[0], P1[1]); wheel(P2[0], P2[1]); wheel(TP[0], TP[1], TR);
+  circ(A[0], A[1], 10, PAPER, 3);
+
+  // Dot C sliding on the cable between disc and second pulley
+  const f = 0.15 + 0.6 * (0.5 + 0.5 * s4);
+  const Cx = E[0] + (P2[0] + 6 - E[0]) * f, Cy = E[1] + (P2[1] + 2 - E[1]) * f;
+  circ(Cx, Cy, 10, INK);
+  leader(Cx + 8, Cy - 6, Cx + 48, Cy - 30);
+  sym('C', null, Cx + 62, Cy - 38, 30);
+}
+
+/* ---------- Scene 2: swinging three-mass assembly (4.0 – 8.65 s) ---------- */
+function sideAssembly(sgn, Mc, angM, u, w) {
+  const s = sin(w * u + 0.4);
+  const gap = 70 - sgn * 24 * s;
+  const ang = angM + 0.2 * sin(w * u + (sgn < 0 ? 1.1 : 2.6));
+  const [cx, cy] = rotp(Mc[0], Mc[1], angM, sgn * (65 + gap + 85), 0);
+
+  // k_s springs
+  [-80, 80].forEach(ly => {
+    const a = rotp(Mc[0], Mc[1], angM, sgn * 65, ly), b = rotp(cx, cy, ang, -sgn * 85, ly);
+    coil(a[0], a[1], b[0], b[1], 4, 15, 4, 2.5);
+    sym('k', 's', (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 + (ly < 0 ? -34 : 36), 26);
+  });
+
+  // m_h hanging arm (drawn under the block)
+  const hph = w * u * 1.15 + (sgn > 0 ? 2 : 0.6);
+  const hp = rotp(cx, cy, ang, 0, 140), ah = PI / 2 + 0.3 * sin(hph);
+  const hb = [hp[0] + 150 * cos(ah), hp[1] + 150 * sin(ah)];
+  if (cos(hph) > 0) dotted(hp[0], hp[1], hp[0], hp[1] + 175);
+  L(hp[0], hp[1], hb[0], hb[1], 8);
+
+  rectRot(cx, cy, 170, 280, ang);
+  sym('m', null, cx, cy, 38);
+  circ(hp[0], hp[1], 9, '#f4f1ea', 3);
+  circ(hb[0], hb[1], 24, INK);
+  leader(hb[0] + sgn * 22, hb[1] + 8, hb[0] + sgn * 56, hb[1] + 30);
+  sym('m', 'h', hb[0] + sgn * 76, hb[1] + 38, 28);
+  const lx = hp[0] - sgn * 52;
+  dim(lx, hp[1], lx, hb[1]);
+  sym('L', 'h', lx - sgn * 26, (hp[1] + hb[1]) / 2, 26);
+  if (sin(hph) > 0.6) { font(22, true); ctx.textAlign = 'center'; ctx.fillText('x', (hp[0] + hb[0]) / 2 + sgn * 18, (hp[1] + hb[1]) / 2); }
+
+  // Side pendulums m_p on the outer edge
+  [-70, 70].forEach((ly, i) => {
+    const p = rotp(cx, cy, ang, sgn * 85, ly);
+    const aa = (sgn < 0 ? PI : 0) + 0.32 * sin(w * u * 1.3 + i * 1.7 + (sgn > 0 ? 0.9 : 0));
+    const dir = [cos(aa), sin(aa)], Lp = 145;
+    const ball = [p[0] + dir[0] * Lp, p[1] + dir[1] * Lp];
+    let n = [-dir[1], dir[0]];
+    if (n[1] * ly < 0) n = [-n[0], -n[1]];
+    L(p[0], p[1], ball[0], ball[1], 8);
+    circ(ball[0], ball[1], 26, INK);
+    bullseye(p[0], p[1]);
+    sym('k', 'tp', p[0] - sgn * 52, p[1] + (ly < 0 ? -22 : 24), 22);
+    dim(p[0] + n[0] * 34, p[1] + n[1] * 34, ball[0] + n[0] * 34, ball[1] + n[1] * 34);
+    const mx = (p[0] + ball[0]) / 2 + n[0] * 58, my = (p[1] + ball[1]) / 2 + n[1] * 58;
+    sym('L', 'p', mx, my, 26);
+    const lb = [ball[0] + dir[0] * 30 - n[0] * 14, ball[1] + dir[1] * 30 - n[1] * 14];
+    leader(ball[0] + dir[0] * 22, ball[1] + dir[1] * 22, lb[0], lb[1]);
+    sym('m', 'p', lb[0] + dir[0] * 26, lb[1] - n[1] * 14, 26);
+  });
+}
+
+function scene2(t) {
+  const u = t - 4, w = 2 * PI / 1.6;
+  ctx.strokeStyle = INK; ctx.fillStyle = INK;
+  const th = 0.13 * sin(w * u);
+
+  // Ceiling, frame arrows, gravity
+  L(375, 595, 665, 595, 6); hatch(375, 595, 665, 595, -1, 18, 16);
+  arrow(375, 595, 375, 478, 3, 16);
+  arrow(375, 608, 462, 608, 3, 16); vec('I', '1', 400, 640, 28);
+  arrow(760, 515, 760, 575, 3, 15); sym('g', null, 785, 545, 30);
+
+  const P = [500, 595], Lrod = 165;
+  const Mt = [P[0] + Lrod * sin(th), P[1] + Lrod * cos(th)];
+  const angM = -th * 0.6;
+  const Mc = rotp(Mt[0], Mt[1], angM, 0, 125);
+
+  dotted(P[0], P[1], P[0], P[1] + 125); sym('θ', null, P[0] - 26, P[1] + 92, 28);
+  dim(600, 597, 600, Mt[1]); sym('L', null, 622, (597 + Mt[1]) / 2, 30);
+
+  sideAssembly(-1, Mc, angM, u, w);
+  sideAssembly(1, Mc, angM, u, w);
+
+  rectRot(Mc[0], Mc[1], 130, 250, angM);
+  sym('M', null, Mc[0], Mc[1] + 10, 40);
+  L(P[0], P[1], Mt[0], Mt[1], 8);
+  circ(P[0], P[1], 9, '#f4f1ea', 3);
+  bullseye(Mt[0], Mt[1], 17);
+  sym('k', 't', Mt[0] + 46, Mt[1] - 18, 26);
+}
+
+/* ---------- Scene 3: two slabs on a sliding base (8.65 – 10 s) ---------- */
+function slab(K, ang) {
+  const S = rotp(K[0], K[1], ang, 0, -52);
+  const C = rotp(K[0], K[1], ang, 0, -66);
+  L(K[0], K[1], S[0], S[1], 6);
+  const t1 = rotp(K[0], K[1], ang, -14, -52), t2 = rotp(K[0], K[1], ang, 14, -52), t3 = rotp(K[0], K[1], ang, 0, -34);
+  rectRot(C[0], C[1], 250, 28, ang);
+  poly([t1, t2, t3]);
+  return { C, ang };
+}
+function scene3(t) {
+  const u = (t - 8.65) / 1.35;
+  ctx.strokeStyle = INK; ctx.fillStyle = INK;
+  const dx = -8 + 46 * ease(u), ph = 2 * PI * u * 1.3;
+
+  // Ground with hatching
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 1015, W, 34); ctx.clip();
+  for (let x = -40; x < 1040; x += 16) L(x, 1050, x + 32, 1016, 2);
+  ctx.restore();
+  L(0, 1015, W, 1015, 6);
+  leader(198, 1090, 236, 1020); sym('μ = 0', null, 160, 1108, 30);
+  vec('I', '1', 22, 1072, 24);
+
+  // Walls
+  L(12, 1015, 12, 922, 7); L(988, 1015, 988, 922, 7);
+  arrow(12, 922, 12, 868, 3, 14);
+
+  // Base + side springs
+  const x0 = 200 + dx;
+  coil(12, 980, x0, 980, 5, 18, 6, 3);
+  coil(x0 + 600, 980, 988, 980, 4, 18, 6, 3);
+  rectRot(x0 + 300, 980, 600, 70);
+  sym('M', null, x0 + 300, 984, 38);
+  arrow(x0 + 28, 1000, x0 + 28, 922, 2.5, 12); vec('M', '2', x0 + 38, 950, 22);
+  arrow(x0 + 28, 1000, x0 + 112, 1000, 2.5, 12); vec('M', '1', x0 + 86, 1000 - 18, 22);
+
+  const K1 = [x0 + 130, 945], K2 = [x0 + 470, 945];
+  const th1 = 0.04 * sin(ph), th2 = -(0.13 + 0.05 * sin(ph + 0.8));
+  const s1 = slab(K1, th1), s2 = slab(K2, th2);
+  bullseye(K1[0], K1[1]); bullseye(K2[0], K2[1]);
+  sym('k', 't1', K1[0] + 52, 1000, 22); sym('k', 't2', K2[0] + 52, 1000, 22);
+
+  // Coupling spring between inner ends
+  const e1 = rotp(s1.C[0], s1.C[1], th1, 125, 0), e2 = rotp(s2.C[0], s2.C[1], th2, -125, 0);
+  coil(e1[0], e1[1], e2[0], e2[1], 4, 11, 6, 2.5);
+  circ(e1[0], e1[1], 6, '#f4f1ea', 2.5); circ(e2[0], e2[1], 6, '#f4f1ea', 2.5);
+  sym('k', 'c', (e1[0] + e2[0]) / 2, (e1[1] + e2[1]) / 2 + 36, 26);
+
+  // m labels
+  for (const s of [s1, s2]) {
+    const c = rotp(s.C[0], s.C[1], s.ang, -125, -14);
+    leader(c[0], c[1], c[0] - 10, c[1] - 52); sym('m', null, c[0] - 16, c[1] - 72, 32);
+  }
+
+  // Angle marks
+  const top1 = rotp(s1.C[0], s1.C[1], th1, 0, -14);
+  dotted(top1[0], top1[1], top1[0], top1[1] - 78); sym('θ', '1', top1[0] + 4, top1[1] - 98, 26);
+  const top2 = rotp(s2.C[0], s2.C[1], th2, 0, -14);
+  dotted(top2[0], top2[1], top2[0], top2[1] - 82);
+  dotted(top2[0], top2[1], top2[0] + 82 * sin(-th2) * -1, top2[1] - 82 * cos(th2));
+  ctx.lineWidth = 1.6; ctx.beginPath(); ctx.arc(top2[0], top2[1], 58, -PI / 2 + th2, -PI / 2); ctx.stroke();
+  head(top2[0] - 58 * sin(-th2) - 4, top2[1] - 58 * cos(th2) + 2, top2[0] + 1, top2[1] - 58, 8);
+  sym('θ', '2', top2[0] - 6, top2[1] - 104, 26);
+
+  dim(10, 1242, 990, 1242); sym('D', null, 500, 1270, 30);
+}
+
+/* ---------- Caption ---------- */
+function caption() {
+  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left'; ctx.lineJoin = 'round';
+  const fs = 52; font(fs, false, true);
+  const lines = ['“The type of questions', 'you see at the back of your', 'Physics test after you already'];
+  const ys = [310, 364, 418, 472];
+  const outlined = (s, x, y) => {
+    ctx.lineWidth = 10; ctx.strokeStyle = '#000'; ctx.strokeText(s, x, y);
+    ctx.fillStyle = '#fff'; ctx.fillText(s, x, y);
+  };
+  lines.forEach((s, i) => outlined(s, 500 - ctx.measureText(s).width / 2, ys[i]));
+  const parts = ['skipped ', '9', ' questions”'];
+  const widths = parts.map(p => ctx.measureText(p).width);
+  let x = 500 - widths.reduce((a, b) => a + b) / 2;
+  parts.forEach((p, i) => {
+    outlined(p, x, ys[3]);
+    if (i === 1) { ctx.lineWidth = 1.8; ctx.strokeStyle = '#fff'; ctx.strokeText(p, x, ys[3]); }
+    x += widths[i];
+  });
+}
+
+/* ---------- Frame ---------- */
+function draw(t) {
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.setLineDash([]);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = PAPER; ctx.fillRect(0, BAND_TOP, W, BAND_BOT - BAND_TOP);
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, BAND_TOP, W, BAND_BOT - BAND_TOP); ctx.clip();
+  if (t < 4.0) scene1(t); else if (t < 8.65) scene2(t); else scene3(t);
+  for (let y = BAND_TOP; y < BAND_BOT; y += 256) for (let x = 0; x < W; x += 256) ctx.drawImage(noise, x, y);
+  ctx.restore();
+
+  caption();
+}
+
+let elapsed = 0, last = performance.now(), playing = true;
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (playing) elapsed = (elapsed + dt) % DURATION;
+  draw(elapsed);
+  bar.style.width = (elapsed / DURATION * 100) + '%';
+  requestAnimationFrame(loop);
+}
+function toggle() { playing = !playing; stage.classList.toggle('is-paused', !playing); }
+stage.addEventListener('click', toggle);
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); toggle(); }
+  if (e.code === 'ArrowRight') elapsed = (elapsed + 0.5) % DURATION;
+  if (e.code === 'ArrowLeft') elapsed = (elapsed - 0.5 + DURATION) % DURATION;
+});
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
